@@ -5,7 +5,6 @@
 from __future__ import division
 from __future__ import print_function
 
-import os
 import numpy as np
 import pandas as pd
 import copy
@@ -19,19 +18,19 @@ from torch.utils.data import DataLoader
 
 from .pytorch_utils import count_parameters
 from ...model.base import Model
-from ...data.dataset import DatasetH, TSDatasetH
 from ...data.dataset.handler import DataHandlerLP
+from .tcn import TemporalConvNet
 
 
-class GRU(Model):
-    """GRU Model
+class TCN(Model):
+    """TCN Model
 
     Parameters
     ----------
     d_feat : int
         input dimension for each time step
     metric: str
-        the evaluate metric used in early stop
+        the evaluation metric used in early stop
     optimizer : str
         optimizer name
     GPU : str
@@ -41,7 +40,8 @@ class GRU(Model):
     def __init__(
         self,
         d_feat=6,
-        hidden_size=64,
+        n_chans=128,
+        kernel_size=5,
         num_layers=2,
         dropout=0.0,
         n_epochs=200,
@@ -57,12 +57,13 @@ class GRU(Model):
         **kwargs
     ):
         # Set logger.
-        self.logger = get_module_logger("GRU")
-        self.logger.info("GRU pytorch version...")
+        self.logger = get_module_logger("TCN")
+        self.logger.info("TCN pytorch version...")
 
         # set hyper-parameters.
         self.d_feat = d_feat
-        self.hidden_size = hidden_size
+        self.n_chans = n_chans
+        self.kernel_size = kernel_size
         self.num_layers = num_layers
         self.dropout = dropout
         self.n_epochs = n_epochs
@@ -77,9 +78,10 @@ class GRU(Model):
         self.seed = seed
 
         self.logger.info(
-            "GRU parameters setting:"
+            "TCN parameters setting:"
             "\nd_feat : {}"
-            "\nhidden_size : {}"
+            "\nn_chans : {}"
+            "\nkernel_size : {}"
             "\nnum_layers : {}"
             "\ndropout : {}"
             "\nn_epochs : {}"
@@ -94,7 +96,8 @@ class GRU(Model):
             "\nuse_GPU : {}"
             "\nseed : {}".format(
                 d_feat,
-                hidden_size,
+                n_chans,
+                kernel_size,
                 num_layers,
                 dropout,
                 n_epochs,
@@ -115,24 +118,25 @@ class GRU(Model):
             np.random.seed(self.seed)
             torch.manual_seed(self.seed)
 
-        self.GRU_model = GRUModel(
-            d_feat=self.d_feat,
-            hidden_size=self.hidden_size,
-            num_layers=self.num_layers,
+        self.TCN_model = TCNModel(
+            num_input=self.d_feat,
+            output_size=1,
+            num_channels=[self.n_chans] * self.num_layers,
+            kernel_size=self.kernel_size,
             dropout=self.dropout,
         )
-        self.logger.info("model:\n{:}".format(self.GRU_model))
-        self.logger.info("model size: {:.4f} MB".format(count_parameters(self.GRU_model)))
+        self.logger.info("model:\n{:}".format(self.TCN_model))
+        self.logger.info("model size: {:.4f} MB".format(count_parameters(self.TCN_model)))
 
         if optimizer.lower() == "adam":
-            self.train_optimizer = optim.Adam(self.GRU_model.parameters(), lr=self.lr)
+            self.train_optimizer = optim.Adam(self.TCN_model.parameters(), lr=self.lr)
         elif optimizer.lower() == "gd":
-            self.train_optimizer = optim.SGD(self.GRU_model.parameters(), lr=self.lr)
+            self.train_optimizer = optim.SGD(self.TCN_model.parameters(), lr=self.lr)
         else:
             raise NotImplementedError("optimizer {} is not supported!".format(optimizer))
 
         self.fitted = False
-        self.GRU_model.to(self.device)
+        self.TCN_model.to(self.device)
 
     @property
     def use_gpu(self):
@@ -141,14 +145,10 @@ class GRU(Model):
     def mse(self, pred, label):
         loss = (pred - label) ** 2
         return torch.mean(loss)
-    
     def batch_ic(self, pred, label):
         vx = pred - torch.mean(pred)
         vy = label - torch.mean(label)
-        loss = torch.sum(vx * vy) / (torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)))
-
-
-        
+        loss = torch.sum(vx * vy) / (torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)))        
         return torch.mean(loss)
 
     def loss_fn(self, pred, label):
@@ -156,7 +156,6 @@ class GRU(Model):
 
         if self.loss == "mse":
             return self.mse(pred[mask], label[mask])
-
         elif self.loss == "batch_ic":
             return -self.batch_ic(pred[mask], label[mask])
 
@@ -166,42 +165,42 @@ class GRU(Model):
 
         mask = torch.isfinite(label)
 
-        if self.metric == "" or self.metric == "loss":
+        if self.metric in ("", "loss"):
             return -self.loss_fn(pred[mask], label[mask])
 
         raise ValueError("unknown metric `%s`" % self.metric)
 
     def train_epoch(self, data_loader):
 
-        self.GRU_model.train()
+        self.TCN_model.train()
 
         for data in data_loader:
-            feature = data[:, :, 0:-1].to(self.device)
+            feature = torch.transpose(data[:, :, 0:-1],1,2).to(self.device)
             label = data[:, -1, -1].to(self.device)
 
-            pred = self.GRU_model(feature.float())
+            pred = self.TCN_model(feature.float())
             loss = self.loss_fn(pred, label)
 
             self.train_optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_value_(self.GRU_model.parameters(), 3.0)
+            torch.nn.utils.clip_grad_value_(self.TCN_model.parameters(), 3.0)
             self.train_optimizer.step()
 
     def test_epoch(self, data_loader):
 
-        self.GRU_model.eval()
+        self.TCN_model.eval()
 
         scores = []
         losses = []
 
         for data in data_loader:
 
-            feature = data[:, :, 0:-1].to(self.device)
+            feature = torch.transpose(data[:, :, 0:-1],1,2).to(self.device)
             # feature[torch.isnan(feature)] = 0
             label = data[:, -1, -1].to(self.device)
 
             with torch.no_grad():
-                pred = self.GRU_model(feature.float())
+                pred = self.TCN_model(feature.float())
                 loss = self.loss_fn(pred, label)
                 losses.append(loss.item())
 
@@ -216,11 +215,15 @@ class GRU(Model):
         evals_result=dict(),
         save_path=None,
     ):
+        
         dl_train = dataset.prepare("train", col_set=["feature", "label"], data_key=DataHandlerLP.DK_L)
         dl_valid = dataset.prepare("valid", col_set=["feature", "label"], data_key=DataHandlerLP.DK_L)
 
-        dl_train.config(fillna_type="ffill+bfill")  # process nan brought by dataloader
-        dl_valid.config(fillna_type="ffill+bfill")  # process nan brought by dataloader
+        # process nan brought by dataloader
+        dl_train.config(fillna_type="ffill+bfill")
+        # process nan brought by dataloader
+        dl_valid.config(fillna_type="ffill+bfill")
+        
 
         train_loader = DataLoader(
             dl_train, batch_size=self.batch_size, shuffle=False, num_workers=self.n_jobs, drop_last=True
@@ -257,7 +260,7 @@ class GRU(Model):
                 best_score = val_score
                 stop_steps = 0
                 best_epoch = step
-                best_param = copy.deepcopy(self.GRU_model.state_dict())
+                best_param = copy.deepcopy(self.TCN_model.state_dict())
             else:
                 stop_steps += 1
                 if stop_steps >= self.early_stop:
@@ -265,7 +268,7 @@ class GRU(Model):
                     break
 
         self.logger.info("best score: %.6lf @ %d" % (best_score, best_epoch))
-        self.GRU_model.load_state_dict(best_param)
+        self.TCN_model.load_state_dict(best_param)
         torch.save(best_param, save_path)
 
         if self.use_gpu:
@@ -278,36 +281,29 @@ class GRU(Model):
         dl_test = dataset.prepare("test", col_set=["feature", "label"], data_key=DataHandlerLP.DK_I)
         dl_test.config(fillna_type="ffill+bfill")
         test_loader = DataLoader(dl_test, batch_size=self.batch_size, num_workers=self.n_jobs)
-        self.GRU_model.eval()
+        self.TCN_model.eval()
         preds = []
 
         for data in test_loader:
 
-            feature = data[:, :, 0:-1].to(self.device)
+            feature = torch.transpose(data[:, :, 0:-1],1,2).to(self.device)
 
             with torch.no_grad():
-                pred = self.GRU_model(feature.float()).detach().cpu().numpy()
+                pred = self.TCN_model(feature.float()).detach().cpu().numpy()
 
             preds.append(pred)
 
         return pd.Series(np.concatenate(preds), index=dl_test.get_index())
 
 
-class GRUModel(nn.Module):
-    def __init__(self, d_feat=6, hidden_size=64, num_layers=2, dropout=0.0):
+class TCNModel(nn.Module):
+    def __init__(self, num_input, output_size, num_channels, kernel_size, dropout):
         super().__init__()
-
-        self.rnn = nn.GRU(
-            input_size=d_feat,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout,
-        )
-        self.fc_out = nn.Linear(hidden_size, 1)
-
-        self.d_feat = d_feat
+        self.num_input = num_input
+        self.tcn = TemporalConvNet(num_input, num_channels, kernel_size, dropout=dropout)
+        self.linear = nn.Linear(num_channels[-1], output_size)
 
     def forward(self, x):
-        out, _ = self.rnn(x)
-        return self.fc_out(out[:, -1, :]).squeeze()
+        output = self.tcn(x)
+        output = self.linear(output[:, :, -1])
+        return output.squeeze()

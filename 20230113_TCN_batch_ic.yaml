@@ -1,0 +1,73 @@
+qlib_init:
+    provider_uri: "../qlib/qlib_data/cn_data"
+    region: cn
+market: &market csi300
+#benchmark: &benchmark SH000300
+data_handler_config: &data_handler_config
+    start_time: 2021-01-01
+    end_time: 2021-12-31
+    fit_start_time: 2021-01-01
+    fit_end_time: 2021-07-31
+    instruments: *market
+    infer_processors:
+        - class: FilterCol
+          kwargs:
+              fields_group: feature
+              col_list: ["RESI5", "WVMA5", "RSQR5", "KLEN", "RSQR10", "CORR5", "CORD5", "CORR10", 
+                            "ROC60", "RESI10", "VSTD5", "RSQR60", "CORR60", "WVMA60", "STD5", 
+                            "RSQR20", "CORD60", "CORD10", "CORR20", "KLOW"
+                        ]
+        - class: RobustZScoreNorm
+          kwargs:
+              fields_group: feature
+              clip_outlier: true
+        - class: Fillna
+          kwargs:
+              fields_group: feature
+    learn_processors:
+        - class: DropnaLabel
+        - class: CSRankNorm
+          kwargs:
+              fields_group: label
+    label: ["Ref($vwap, -2) / Ref($vwap, -1) - 1"]
+
+
+task:
+    model:
+        class: TCN
+        module_path: qlib.contrib.model.pytorch_tcn_ts_chg
+        kwargs:
+            d_feat: 20
+            num_layers: 5
+            n_chans: 32
+            kernel_size: 7
+            dropout: 0.5
+            n_epochs: 200
+            lr: 0.001
+            early_stop: 20
+            batch_size: 2000
+            metric: loss
+            loss: mse
+            optimizer: adam
+            n_jobs: 1
+            GPU: 0
+    dataset:
+        class: TSDatasetH
+        module_path: qlib.data.dataset
+        kwargs:
+            handler:
+                class: Alpha158
+                module_path: qlib.contrib.data.handler
+                kwargs: *data_handler_config
+            segments:
+                train: [2021-01-01, 2021-07-31]
+                valid: [2021-08-01, 2021-09-30]
+                test: [2021-10-01, 2021-12-31]
+            step_len: 40
+    record: 
+        - class: SignalRecord
+          module_path: qlib.workflow.record_temp
+          kwargs: 
+            model: <MODEL>
+            dataset: <DATASET>
+       
